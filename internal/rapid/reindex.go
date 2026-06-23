@@ -86,23 +86,18 @@ func (rm *ReindexManager) reindex(repoPath string) {
 	elapsed := time.Since(start)
 	log.Printf("[%s] reindexed in %s", repoPath, elapsed.Round(time.Millisecond))
 
-	// Update indexed SHA and status.
-	bh, err := GetBranchAndHead(repoPath)
+	// Update indexed SHA and recompute the delta against the new HEAD, both
+	// from a single git invocation.
+	bh, dirty, err := GetRepoState(repoPath)
 	if err == nil {
 		rm.state.SetIndexed(repoPath, bh.SHA)
-	}
-	rm.state.SetStatus(repoPath, RepoIdle)
-
-	// Recompute delta against new HEAD.
-	dirty, err := GetDirtyFiles(repoPath)
-	if err == nil {
 		if len(dirty) > 0 {
-			delta := BuildDeltaIndex(repoPath, dirty)
-			rm.state.SetDelta(repoPath, delta)
+			rm.state.SetDelta(repoPath, BuildDeltaIndex(repoPath, dirty))
 		} else {
 			rm.state.SetDelta(repoPath, nil)
 		}
 	}
+	rm.state.SetStatus(repoPath, RepoIdle)
 
 	// Refresh the proxy's repo name map since zoekt may have new shard names.
 	rm.proxy.RefreshRepoMap()

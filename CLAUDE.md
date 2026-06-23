@@ -8,7 +8,7 @@ Self-contained local code search stack. Installs zoekt, adds live working tree a
 neogrok :3000 → zoekt-vanzelf :6071 → zoekt-webserver :6070 → ~/.zoekt/*.zoekt
                      │
                      ├── delta index (in-memory trigram index of dirty files)
-                     ├── repo poller (git status every 2s + fsnotify)
+                     ├── repo poller (git status every 10s + fsnotify)
                      └── reindex manager (runs zoekt-git-index on branch/HEAD change)
 ```
 
@@ -65,7 +65,7 @@ internal/rapid/                  — library code (package rapid):
   discovery.go                   — find git repos under configured roots
   git.go                         — git subprocess helpers
   state.go                       — thread-safe repo state table
-  poller.go                      — polling loop (2s repo poll, 60s discovery)
+  poller.go                      — polling loop (10s repo poll, 60s discovery)
   trigram.go                     — trigram extraction and posting list index
   delta.go                       — delta index build and regex search
   proxy.go                       — zoekt API proxy with delta merge
@@ -73,6 +73,7 @@ internal/rapid/                  — library code (package rapid):
   reindex.go                     — reindex manager with concurrency limiting
   scheduler.go                   — hourly full reindex scheduler
   watcher.go                     — fsnotify watcher for instant file change detection
+                                   (skips .git, configured skip-dirs, and gitignored subtrees)
 skill/                           — CLI and editor integrations:
   zoekt-search                   — Python CLI for terminal search
   SKILL.md                       — Claude Code auto-triggered skill
@@ -83,7 +84,7 @@ install.sh                       — one-command installer
 ## How delta merge works
 
 On each poll cycle for each repo:
-1. Run `git status --porcelain=v2` to get dirty files
+1. Run `git status --porcelain=v2 --branch` once to get branch, HEAD SHA, and dirty files (one git fork per repo per cycle)
 2. Read dirty file contents from working tree
 3. Build trigram index of dirty files (rebuild from scratch each cycle)
 
@@ -106,7 +107,7 @@ Managed via `~/Library/LaunchAgents/com.zoekt.*.plist`:
 - Scan depth: 3
 - Proxy port: 6071
 - Zoekt URL: `http://localhost:6070`
-- Repo poll interval: 2s
+- Repo poll interval: 10s
 - Discovery interval: 60s
 - Reindex interval: 1h
 - Max concurrent reindex: 2

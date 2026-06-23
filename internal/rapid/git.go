@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"strings"
 	"time"
 )
 
@@ -53,51 +52,92 @@ func (s FileStatus) String() string {
 	}
 }
 
-// GetBranchAndHead returns the current branch and HEAD SHA for a repo.
-func GetBranchAndHead(repoPath string) (BranchHead, error) {
+// GetRepoState returns the branch, HEAD SHA, and dirty files for a repo from a
+// single `git status --porcelain=v2 --branch` invocation. The --branch flag
+// prepends "# branch.oid" / "# branch.head" header lines, so we get everything
+// pollRepo needs from one git subprocess instead of three (the old path forked
+// symbolic-ref + rev-parse + status). At 28 repos polled on a timer this is the
+// dominant CPU cost, so collapsing 3 forks into 1 matters.
+func GetRepoState(repoPath string) (BranchHead, []DirtyFile, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
 
-	// Use symbolic-ref for branch name (works on empty repos).
-	// Falls back to rev-parse --abbrev-ref for detached HEAD.
-	var branch string
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "symbolic-ref", "--short", "HEAD")
-	branchOut, err := cmd.Output()
-	if err != nil {
-		// Detached HEAD — fall back.
-		cmd = exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD")
-		branchOut, err = cmd.Output()
-		if err != nil {
-			return BranchHead{}, fmt.Errorf("git branch: %w", err)
-		}
-	}
-	branch = strings.TrimSpace(string(branchOut))
-
-	cmd = exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "HEAD")
-	shaOut, err := cmd.Output()
-	if err != nil {
-		// Empty repo (no commits yet).
-		return BranchHead{Branch: branch, SHA: ""}, nil
-	}
-
-	return BranchHead{
-		Branch: branch,
-		SHA:    strings.TrimSpace(string(shaOut)),
-	}, nil
-}
-
-// GetDirtyFiles returns files whose working tree content differs from HEAD.
-func GetDirtyFiles(repoPath string) ([]DirtyFile, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2")
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("git status: %w", err)
+		return BranchHead{}, nil, fmt.Errorf("git status: %w", err)
 	}
 
-	return ParsePorcelainV2(out)
+	bh := parseBranchHeader(out)
+	files, err := ParsePorcelainV2(out) // file entries only; "# branch.*" headers are ignored
+	if err != nil {
+		return BranchHead{}, nil, err
+	}
+	return bh, files, nil
+}
+
+// GetIgnoredDirs returns the gitignored directories for a repo as paths
+// relative to the repo root (no trailing slash). It's used by the fsnotify
+// watcher to prune entire subtrees (node_modules, build output, live data/log
+// dirs): their contents never appear in `git status`, so they never enter the
+// delta index, so watching them produces only no-op polls.
+//
+// One `git ls-files --directory` call per repo collapses each ignored dir to a
+// single "dir/" entry instead of listing its contents. Ignored individual
+// files are skipped — we only prune directories.
+func GetIgnoredDirs(repoPath string) (map[string]bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath,
+		"-c", "core.quotePath=false", // keep non-ASCII paths unquoted so prefixes match
+		"ls-files", "--others", "--ignored", "--exclude-standard", "--directory")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w", err)
+	}
+
+	dirs := make(map[string]bool)
+	for _, line := range bytes.Split(out, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		// Only directories carry a trailing slash; ignored files don't and
+		// aren't worth pruning.
+		if line[len(line)-1] != '/' {
+			continue
+		}
+		dirs[string(line[:len(line)-1])] = true
+	}
+	return dirs, nil
+}
+
+// parseBranchHeader extracts the branch name and HEAD SHA from the "# branch.*"
+// header lines emitted by `git status --porcelain=v2 --branch`. Its output
+// matches the old symbolic-ref/rev-parse pair so repo-change detection is
+// unchanged:
+//   - an empty repo reports "# branch.oid (initial)" -> SHA stays ""
+//   - a detached HEAD reports "# branch.head (detached)" -> branch "HEAD"
+//     (the same value `git rev-parse --abbrev-ref HEAD` returned before)
+func parseBranchHeader(data []byte) BranchHead {
+	var bh BranchHead
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		switch {
+		case bytes.HasPrefix(line, []byte("# branch.oid ")):
+			oid := string(bytes.TrimSpace(line[len("# branch.oid "):]))
+			if oid != "(initial)" {
+				bh.SHA = oid
+			}
+		case bytes.HasPrefix(line, []byte("# branch.head ")):
+			head := string(bytes.TrimSpace(line[len("# branch.head "):]))
+			if head == "(detached)" {
+				head = "HEAD"
+			}
+			bh.Branch = head
+		}
+	}
+	return bh
 }
 
 // ParsePorcelainV2 parses the output of `git status --porcelain=v2`.

@@ -56,7 +56,7 @@ func DefaultConfig() Config {
 		ExcludePatterns:      []string{"*/node_modules/*", "*/vendor/*", "*/.terraform/*"},
 		ProxyPort:            6071,
 		ZoektURL:             "http://localhost:6070",
-		RepoPollInterval:     2 * time.Second,
+		RepoPollInterval:     10 * time.Second,
 		DiscoveryInterval:    60 * time.Second,
 		ReindexInterval:      time.Hour,
 		DataDir:              filepath.Join(home, ".zoekt"),

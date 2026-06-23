@@ -102,15 +102,9 @@ func (p *Poller) pollRepo(path string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	bh, err := GetBranchAndHead(path)
+	bh, dirty, err := GetRepoState(path)
 	if err != nil {
 		log.Printf("[%s] git error: %v", path, err)
-		return
-	}
-
-	dirty, err := GetDirtyFiles(path)
-	if err != nil {
-		log.Printf("[%s] git status error: %v", path, err)
 		return
 	}
 
