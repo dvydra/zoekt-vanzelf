@@ -141,8 +141,18 @@ func (w *Watcher) Close() error {
 	return w.watcher.Close()
 }
 
-// addRecursive walks a repo directory and adds watches for all subdirectories.
+// addRecursive walks a repo directory and adds watches for all subdirectories,
+// skipping .git, the configured skip-dir names, and any gitignored directory.
 func (w *Watcher) addRecursive(root string) {
+	// Gitignored dirs never enter `git status`, so watching them only produces
+	// no-op polls. Fetch them once per repo and prune whole subtrees in the
+	// walk. Best-effort: on error we fall back to the name-based skips below.
+	ignored, err := GetIgnoredDirs(root)
+	if err != nil {
+		log.Printf("[watcher] %s: ignored-dir lookup failed, watching all: %v", root, err)
+		ignored = nil
+	}
+
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -153,6 +163,12 @@ func (w *Watcher) addRecursive(root string) {
 		name := d.Name()
 		if name == ".git" || w.skipDirs[name] {
 			return filepath.SkipDir
+		}
+		// Prune gitignored subtrees (path != root: a repo root is never ignored).
+		if ignored != nil && path != root {
+			if rel, relErr := filepath.Rel(root, path); relErr == nil && ignored[rel] {
+				return filepath.SkipDir
+			}
 		}
 		if err := w.watcher.Add(path); err != nil {
 			log.Printf("[watcher] failed to watch %s: %v", path, err)
