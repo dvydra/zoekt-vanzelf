@@ -46,6 +46,16 @@ type Config struct {
 
 	// What to do during reindex gap: "stale" or "blackout".
 	ReindexGapMode string
+
+	// Index the remote default branch (origin/main) alongside the working
+	// tree's HEAD, so search covers what is actually on main — including
+	// merged work that never landed in the local checkout.
+	IndexRemoteDefault bool
+
+	// How often to re-resolve remote-tracking refs. A fetch moves
+	// refs/remotes/origin/* without touching HEAD, the index, or the working
+	// tree, so neither the repo poll nor fsnotify can see it.
+	RemoteRefInterval time.Duration
 }
 
 func DefaultConfig() Config {
@@ -65,5 +75,7 @@ func DefaultConfig() Config {
 		MaxDeltaBytes:        50 * 1024 * 1024, // 50 MB
 		WatchSkipDirs:        []string{"node_modules", "vendor", ".terraform", ".next", "__pycache__", ".build", "dist", ".cache"},
 		ReindexGapMode:       "stale",
+		IndexRemoteDefault:   true,
+		RemoteRefInterval:    60 * time.Second,
 	}
 }

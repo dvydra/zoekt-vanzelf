@@ -48,6 +48,15 @@ func (p *Poller) Run(ctx context.Context) {
 	discoveryTicker := time.NewTicker(p.config.DiscoveryInterval)
 	defer discoveryTicker.Stop()
 
+	// A zero interval disables the remote-ref check; receiving from a nil
+	// channel blocks forever, so the select arm simply never fires.
+	var remoteRefC <-chan time.Time
+	if p.config.RemoteRefInterval > 0 {
+		remoteRefTicker := time.NewTicker(p.config.RemoteRefInterval)
+		defer remoteRefTicker.Stop()
+		remoteRefC = remoteRefTicker.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -56,8 +65,65 @@ func (p *Poller) Run(ctx context.Context) {
 			p.pollAll()
 		case <-discoveryTicker.C:
 			p.discoverAndPoll()
+		case <-remoteRefC:
+			p.checkRemoteRefs()
 		}
 	}
+}
+
+// checkRemoteRefs re-resolves every repo's remote default branch and reindexes
+// the ones whose shard is behind it.
+//
+// A fetch writes refs/remotes/origin/* and nothing else — no HEAD move, no
+// index write, no working tree change — so `git status` sees nothing and the
+// fsnotify watcher (which skips .git entirely) sees nothing. Polling the refs
+// is the only way to notice, and the shard's own record of each branch's SHA is
+// the comparison point, so this survives restarts without extra state.
+func (p *Poller) checkRemoteRefs() {
+	if p.Reindex == nil || p.Proxy == nil || !p.config.IndexRemoteDefault {
+		return
+	}
+
+	for _, path := range p.state.Paths() {
+		rr, indexed, need := p.remoteRefNeedsReindex(path)
+		if !need {
+			continue
+		}
+		if indexed == "" {
+			log.Printf("[%s] %s missing from shard — reindexing to add it", path, rr.Branch)
+		} else {
+			log.Printf("[%s] %s moved: %s → %s", path, rr.Branch, shortSHA(indexed), shortSHA(rr.SHA))
+		}
+
+		p.state.SetStatus(path, RepoStale)
+		p.Reindex.TriggerReindex(path)
+	}
+}
+
+// remoteRefNeedsReindex reports whether a repo's shard is behind its remote
+// default branch, returning the resolved ref and the SHA the shard currently
+// holds for it ("" when the shard has no such branch).
+func (p *Poller) remoteRefNeedsReindex(path string) (RemoteRef, string, bool) {
+	if p.Reindex != nil && p.Reindex.IsBusy(path) {
+		return RemoteRef{}, "", false
+	}
+	// Leave failing repos to the hourly full reindex rather than retrying them
+	// every cycle.
+	if s := p.state.Get(path); s != nil && s.Status == RepoError {
+		return RemoteRef{}, "", false
+	}
+
+	rr, err := GetRemoteDefault(path)
+	if err != nil {
+		log.Printf("[%s] remote ref check failed: %v", path, err)
+		return RemoteRef{}, "", false
+	}
+	if rr.Branch == "" {
+		return rr, "", false // local-only repo, nothing to track
+	}
+
+	indexed := p.Proxy.IndexedBranchSHA(path, rr.Branch)
+	return rr, indexed, indexed != rr.SHA
 }
 
 func (p *Poller) discoverAndPoll() {

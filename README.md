@@ -13,7 +13,8 @@ neogrok :3000 → zoekt-vanzelf :6071 → zoekt-webserver :6070 → ~/.zoekt/*.z
                      │
                      ├── delta index   (in-memory trigram index of dirty files)
                      ├── repo poller   (git status every 2s + fsnotify)
-                     └── reindex mgr   (zoekt-git-index on branch/HEAD change)
+                     ├── remote refs   (for-each-ref every 60s, catches fetches)
+                     └── reindex mgr   (zoekt-git-index on branch/HEAD/origin change)
 ```
 
 zoekt-vanzelf merges results from two sources:
@@ -30,7 +31,15 @@ On every search request, zoekt-vanzelf forwards the query to zoekt, then **suppr
 | File edit/create/delete | fsnotify + git status | ~50ms |
 | Branch switch | git status poll (2s) | ~2s |
 | New commit (HEAD change) | git status poll → reindex | seconds–minutes |
+| `origin/main` moved by a fetch | remote ref poll (60s) → reindex | ~60s + index time |
 | New repo appears under `~/src` | discovery poll (60s) | ~60s |
+
+### Branches
+
+Shards carry two branches: `HEAD` (your checkout) and the remote default branch
+(`origin/main`). So search finds work other people merged but you haven't pulled,
+as well as your own unpushed commits. `branch:origin/main` narrows a query to
+pushed state.
 
 ## Install
 
