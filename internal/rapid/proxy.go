@@ -43,6 +43,11 @@ type SearchProxy struct {
 	nameToPath  map[string]string   // zoekt repo name → local path
 	pathToNames map[string][]string // local path → zoekt repo names (can be multiple)
 	pathToSHA   map[string]string   // local path → indexed SHA from zoekt
+
+	// local path → branch name → indexed SHA. The shard's own record of what
+	// each branch was at index time; used to spot a fetched remote branch that
+	// the shard hasn't caught up with.
+	pathToBranchSHA map[string]map[string]string
 }
 
 func NewSearchProxy(zoektURL string, state *StateTable) *SearchProxy {
@@ -53,6 +58,8 @@ func NewSearchProxy(zoektURL string, state *StateTable) *SearchProxy {
 		nameToPath:  make(map[string]string),
 		pathToNames: make(map[string][]string),
 		pathToSHA:   make(map[string]string),
+
+		pathToBranchSHA: make(map[string]map[string]string),
 	}
 }
 
@@ -97,6 +104,7 @@ func (p *SearchProxy) RefreshRepoMap() {
 	nameToPath := make(map[string]string)
 	pathToNames := make(map[string][]string)
 	pathToSHA := make(map[string]string)
+	pathToBranchSHA := make(map[string]map[string]string)
 
 	for _, r := range lr.List.Repos {
 		name := r.Repository.Name
@@ -111,11 +119,19 @@ func (p *SearchProxy) RefreshRepoMap() {
 		}
 		nameToPath[name] = abs
 		pathToNames[abs] = append(pathToNames[abs], name)
-		// Extract indexed SHA from HEAD branch.
+		// Record every indexed branch; HEAD also gets its own fast path.
+		branchSHA := pathToBranchSHA[abs]
+		if branchSHA == nil {
+			branchSHA = make(map[string]string, len(r.Repository.Branches))
+			pathToBranchSHA[abs] = branchSHA
+		}
 		for _, b := range r.Repository.Branches {
-			if b.Name == "HEAD" && b.Version != "" {
+			if b.Version == "" {
+				continue
+			}
+			branchSHA[b.Name] = b.Version
+			if b.Name == "HEAD" {
 				pathToSHA[abs] = b.Version
-				break
 			}
 		}
 	}
@@ -124,6 +140,7 @@ func (p *SearchProxy) RefreshRepoMap() {
 	p.nameToPath = nameToPath
 	p.pathToNames = pathToNames
 	p.pathToSHA = pathToSHA
+	p.pathToBranchSHA = pathToBranchSHA
 	p.mu.Unlock()
 
 	log.Printf("refreshed repo map: %d zoekt repos mapped", len(nameToPath))
@@ -135,6 +152,17 @@ func (p *SearchProxy) IndexedSHA(repoPath string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.pathToSHA[repoPath]
+}
+
+// IndexedBranchSHA returns the SHA zoekt has indexed for a specific branch of a
+// repo, or empty string if that branch isn't in the shard at all. An absent
+// branch reads the same as an out-of-date one, which is what we want: a shard
+// built before remote-branch indexing was enabled needs the same reindex a
+// stale one does.
+func (p *SearchProxy) IndexedBranchSHA(repoPath, branch string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pathToBranchSHA[repoPath][branch]
 }
 
 // Search forwards a query to zoekt and merges delta index results.

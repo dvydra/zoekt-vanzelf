@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,7 +77,7 @@ func (rm *ReindexManager) reindex(repoPath string) {
 	log.Printf("[%s] reindexing...", repoPath)
 	start := time.Now()
 
-	err := runZoektGitIndex(repoPath, rm.config.DataDir)
+	err := runZoektGitIndex(repoPath, rm.config.DataDir, rm.branchesFor(repoPath))
 	if err != nil {
 		log.Printf("[%s] reindex failed: %v", repoPath, err)
 		rm.state.SetStatus(repoPath, RepoError)
@@ -112,12 +113,40 @@ func (rm *ReindexManager) ReindexAll() {
 	}
 }
 
-func runZoektGitIndex(repoPath, dataDir string) error {
+// branchesFor returns the branch list to index for a repo. HEAD always comes
+// first; the remote default branch is appended when the repo has one, so search
+// covers pushed state as well as the local checkout.
+//
+// Indexing both is close to free: zoekt stores each unique blob once and tags
+// it with a branch mask, so branches that share content share storage.
+func (rm *ReindexManager) branchesFor(repoPath string) []string {
+	branches := []string{"HEAD"}
+	if !rm.config.IndexRemoteDefault {
+		return branches
+	}
+	rr, err := GetRemoteDefault(repoPath)
+	if err != nil {
+		log.Printf("[%s] remote ref lookup failed, indexing HEAD only: %v", repoPath, err)
+		return branches
+	}
+	if rr.Branch != "" {
+		branches = append(branches, rr.Branch)
+	}
+	return branches
+}
+
+func runZoektGitIndex(repoPath, dataDir string, branches []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// -prefix resolves the non-HEAD branch names above; "HEAD" itself is
+	// special-cased by zoekt-git-index and ignores the prefix.
+	// -allow_missing_branches keeps a repo indexable when a candidate ref is
+	// absent, instead of failing the whole shard.
 	cmd := exec.CommandContext(ctx, "zoekt-git-index",
-		"-branches", "HEAD",
+		"-branches", strings.Join(branches, ","),
+		"-prefix", "refs/remotes/",
+		"-allow_missing_branches",
 		"-index", dataDir,
 		repoPath,
 	)

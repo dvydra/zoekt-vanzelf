@@ -268,3 +268,75 @@ func classifyXY(xy string) FileStatus {
 
 	return FileModified
 }
+
+// RemoteRef identifies a remote-tracking branch and the commit it points at.
+type RemoteRef struct {
+	Branch string // short name, e.g. "origin/main"; empty if the repo has none
+	SHA    string
+}
+
+// GetRemoteDefault resolves a repo's remote default branch and its SHA.
+// Resolution order matches what a clone leaves behind: the
+// refs/remotes/origin/HEAD symref first, then origin/main, then origin/master.
+//
+// A repo with no origin returns a zero RemoteRef and no error — local-only
+// scratch repos are normal under ~/src, and having nothing to index there is
+// not a failure.
+//
+// One `git for-each-ref` fork covers all three candidates. This runs on the
+// slower remote-ref ticker, not the repo poll, so it leaves the poller's
+// one-fork-per-repo-per-cycle budget alone.
+func GetRemoteDefault(repoPath string) (RemoteRef, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "for-each-ref",
+		"--format=%(refname:short)\t%(objectname)\t%(symref:short)",
+		"refs/remotes/origin/HEAD",
+		"refs/remotes/origin/main",
+		"refs/remotes/origin/master",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return RemoteRef{}, fmt.Errorf("git for-each-ref: %w", err)
+	}
+	return parseRemoteDefault(out), nil
+}
+
+// parseRemoteDefault picks the default branch out of for-each-ref output.
+//
+// refs/remotes/origin/HEAD shortens to just "origin", so it's identified by
+// carrying a symref target rather than by name; its objectname is already
+// resolved through the symref. A symref pointing at a deleted branch prints an
+// empty objectname, which falls through to the main/master candidates.
+func parseRemoteDefault(out []byte) RemoteRef {
+	var symref RemoteRef
+	byName := make(map[string]string, 2)
+
+	for _, line := range bytes.Split(out, []byte("\n")) {
+		fields := bytes.SplitN(line, []byte("\t"), 3)
+		if len(fields) < 3 {
+			continue
+		}
+		name, sha, target := string(fields[0]), string(fields[1]), string(fields[2])
+		if target != "" {
+			if sha != "" {
+				symref = RemoteRef{Branch: target, SHA: sha}
+			}
+			continue
+		}
+		if sha != "" {
+			byName[name] = sha
+		}
+	}
+
+	if symref.Branch != "" {
+		return symref
+	}
+	for _, candidate := range []string{"origin/main", "origin/master"} {
+		if sha := byName[candidate]; sha != "" {
+			return RemoteRef{Branch: candidate, SHA: sha}
+		}
+	}
+	return RemoteRef{}
+}

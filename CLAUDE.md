@@ -9,7 +9,8 @@ neogrok :3000 → zoekt-vanzelf :6071 → zoekt-webserver :6070 → ~/.zoekt/*.z
                      │
                      ├── delta index (in-memory trigram index of dirty files)
                      ├── repo poller (git status every 10s + fsnotify)
-                     └── reindex manager (runs zoekt-git-index on branch/HEAD change)
+                     ├── remote ref check (for-each-ref every 60s)
+                     └── reindex manager (runs zoekt-git-index on branch/HEAD/origin change)
 ```
 
 zoekt-vanzelf merges results from two sources:
@@ -17,6 +18,31 @@ zoekt-vanzelf merges results from two sources:
 2. **Delta index** — in-memory trigram index of files modified since the base index
 
 For dirty files, zoekt results are suppressed and replaced with delta results.
+
+## What gets indexed
+
+Each shard holds two branches: `HEAD` (the local checkout) and the repo's remote
+default branch (`origin/main`, or whatever `refs/remotes/origin/HEAD` resolves
+to). Indexing both means search covers work merged by other people that never
+landed in the local checkout, without losing local commits that were never
+pushed. Filter with `branch:origin/main` to search only pushed state.
+
+The second branch is close to free: zoekt stores each unique blob once and tags
+it with a branch mask, so content shared between the two costs nothing extra.
+
+Set `IndexRemoteDefault: false` to go back to HEAD-only shards.
+
+## How remote branch updates are detected
+
+A fetch writes `refs/remotes/origin/*` and nothing else — no HEAD move, no index
+write, no working tree change. `git status` shows nothing and the fsnotify
+watcher skips `.git` entirely, so neither of the two normal reindex triggers can
+see it. A separate ticker (`RemoteRefInterval`, 60s) re-resolves each repo's
+remote default branch and compares it to the SHA **the shard itself records** for
+that branch, via zoekt's `/api/list`. Using the shard as the comparison point
+means the check needs no persisted state and survives restarts, and a shard
+built before remote-branch indexing reads as "branch missing" — which triggers
+the one-time reindex that adds it.
 
 ## What the installer sets up
 
@@ -63,7 +89,8 @@ cmd/zoekt-vanzelf/main.go        — CLI entry point and subcommand dispatch
 internal/rapid/                  — library code (package rapid):
   config.go                      — configuration with defaults
   discovery.go                   — find git repos under configured roots
-  git.go                         — git subprocess helpers
+  git.go                         — git subprocess helpers (status parsing,
+                                   ignored dirs, remote default branch)
   state.go                       — thread-safe repo state table
   poller.go                      — polling loop (10s repo poll, 60s discovery)
   trigram.go                     — trigram extraction and posting list index
@@ -109,7 +136,9 @@ Managed via `~/Library/LaunchAgents/com.zoekt.*.plist`:
 - Zoekt URL: `http://localhost:6070`
 - Repo poll interval: 10s
 - Discovery interval: 60s
+- Remote ref interval: 60s (0 disables the check)
 - Reindex interval: 1h
 - Max concurrent reindex: 2
 - Max dirty files per repo: 500
 - Max delta bytes per repo: 50MB
+- Index remote default branch: true
