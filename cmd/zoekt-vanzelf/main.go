@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,6 +118,7 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	rootsFlag := fs.String("roots", "", "comma-separated root directories (default: ~/src)")
 	portFlag := fs.Int("port", 0, "proxy listen port (default: 6071)")
+	hostFlag := fs.String("host", "", "proxy listen address (default: 127.0.0.1; use 0.0.0.0 to publish on the network)")
 	zoektFlag := fs.String("zoekt", "", "upstream zoekt URL (default: http://localhost:6070)")
 	fs.Parse(args)
 
@@ -125,6 +128,9 @@ func cmdServe(args []string) {
 	}
 	if *portFlag > 0 {
 		cfg.ProxyPort = *portFlag
+	}
+	if *hostFlag != "" {
+		cfg.ProxyHost = *hostFlag
 	}
 	if *zoektFlag != "" {
 		cfg.ZoektURL = *zoektFlag
@@ -140,7 +146,7 @@ func cmdServe(args []string) {
 	poller.Reindex = reindexMgr
 	poller.Proxy = proxy
 	scheduler := rapid.NewScheduler(cfg, reindexMgr)
-	srv := rapid.NewServer(proxy, state, reindexMgr, poller, scheduler, cfg.ProxyPort, cfg.ZoektURL)
+	srv := rapid.NewServer(proxy, state, reindexMgr, poller, scheduler, cfg.ProxyHost, cfg.ProxyPort, cfg.ZoektURL)
 
 	// Refresh repo map from zoekt on startup (needed for smart startup).
 	proxy.RefreshRepoMap()
@@ -175,7 +181,7 @@ func cmdServe(args []string) {
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "zoekt-vanzelf proxy on :%d → %s\n", cfg.ProxyPort, cfg.ZoektURL)
+	fmt.Fprintf(os.Stderr, "zoekt-vanzelf proxy on %s → %s\n", net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort)), cfg.ZoektURL)
 
 	// Run server (blocks until error or signal).
 	go func() {

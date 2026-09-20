@@ -2,10 +2,11 @@ package rapid
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,24 +18,37 @@ type Server struct {
 	reindex   *ReindexManager
 	poller    *Poller
 	scheduler *Scheduler
+	host      string
 	port      int
 	zoektURL  string
 	client    *http.Client
 	startedAt time.Time
 }
 
-func NewServer(proxy *SearchProxy, state *StateTable, reindex *ReindexManager, poller *Poller, scheduler *Scheduler, port int, zoektURL string) *Server {
+func NewServer(proxy *SearchProxy, state *StateTable, reindex *ReindexManager, poller *Poller, scheduler *Scheduler, host string, port int, zoektURL string) *Server {
 	return &Server{
 		proxy:     proxy,
 		state:     state,
 		reindex:   reindex,
 		poller:    poller,
 		scheduler: scheduler,
+		host:      host,
 		port:      port,
 		zoektURL:  zoektURL,
 		client:    &http.Client{},
 		startedAt: time.Now(),
 	}
+}
+
+// Addr is the address the server binds. An empty host would mean every
+// interface, which this server must never default to: it proxies a searchable
+// index of every repository under the configured roots.
+func (s *Server) Addr() string {
+	host := s.host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(s.port))
 }
 
 // ListenAndServe starts the HTTP server.
@@ -47,7 +61,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/reindex", s.handleReindex)
 	mux.HandleFunc("/api/rescan", s.handleRescan)
 
-	addr := fmt.Sprintf(":%d", s.port)
+	addr := s.Addr()
 	log.Printf("listening on %s", addr)
 	return http.ListenAndServe(addr, mux)
 }

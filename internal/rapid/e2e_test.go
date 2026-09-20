@@ -73,7 +73,7 @@ func goodbye() {
 	poller.Reindex = nil // don't trigger real zoekt-git-index in tests
 	poller.Proxy = proxy
 	scheduler := NewScheduler(cfg, reindexMgr)
-	srv := NewServer(proxy, state, reindexMgr, poller, scheduler, cfg.ProxyPort, cfg.ZoektURL)
+	srv := NewServer(proxy, state, reindexMgr, poller, scheduler, cfg.ProxyHost, cfg.ProxyPort, cfg.ZoektURL)
 
 	proxy.RefreshRepoMap()
 	go poller.Run(ctx)
@@ -276,7 +276,7 @@ func TestE2E_ProxyMerge_EditFile(t *testing.T) {
 	poller.Reindex = nil
 	poller.Proxy = proxy
 	scheduler := NewScheduler(cfg, reindexMgr)
-	srv := NewServer(proxy, state, reindexMgr, poller, scheduler, cfg.ProxyPort, cfg.ZoektURL)
+	srv := NewServer(proxy, state, reindexMgr, poller, scheduler, cfg.ProxyHost, cfg.ProxyPort, cfg.ZoektURL)
 
 	proxy.RefreshRepoMap()
 	go poller.Run(ctx)

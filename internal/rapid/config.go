@@ -17,6 +17,7 @@ type Config struct {
 	ExcludePatterns []string
 
 	// Port for the zoekt-vanzelf proxy.
+	ProxyHost string
 	ProxyPort int
 
 	// Upstream zoekt-webserver URL.
@@ -61,9 +62,12 @@ type Config struct {
 func DefaultConfig() Config {
 	home, _ := os.UserHomeDir()
 	return Config{
-		Roots:                []string{filepath.Join(home, "src")},
-		ScanDepth:            3,
-		ExcludePatterns:      []string{"*/node_modules/*", "*/vendor/*", "*/.terraform/*"},
+		Roots:           []string{filepath.Join(home, "src")},
+		ScanDepth:       3,
+		ExcludePatterns: []string{"*/node_modules/*", "*/vendor/*", "*/.terraform/*"},
+		// Loopback by default: this proxy serves a searchable index of every
+		// repo under ~/src, and binding 0.0.0.0 hands that to the whole LAN.
+		ProxyHost:            "127.0.0.1",
 		ProxyPort:            6071,
 		ZoektURL:             "http://localhost:6070",
 		RepoPollInterval:     10 * time.Second,
