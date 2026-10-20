@@ -94,9 +94,6 @@ ok "GOBIN: $GOBIN"
 # Ensure GOBIN is in PATH for the rest of this script.
 export PATH="$GOBIN:$PATH"
 
-# Build the PATH that launchd agents will use.
-AGENT_PATH="$GOBIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
 # --- Install zoekt ---
 
 info "Installing zoekt"
@@ -129,6 +126,14 @@ else
     go install github.com/dvydra/zoekt-vanzelf/cmd/zoekt-vanzelf@latest
 fi
 ok "zoekt-vanzelf → $GOBIN/zoekt-vanzelf"
+
+# Build the PATH that launchd agents will use (they don't inherit the shell's).
+# zoekt-git-index may live outside the current GOBIN (a symlink in ~/.local/bin,
+# or an older Go's bin dir) and zoekt-vanzelf execs it by name, so its directory
+# goes on the agent PATH explicitly. Without it every reindex fails with
+# "executable file not found in $PATH".
+ZOEKT_INDEX_BIN_DIR="$(dirname "$(command -v zoekt-git-index)")"
+AGENT_PATH="$GOBIN:$ZOEKT_INDEX_BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # --- Install neogrok (optional) ---
 
