@@ -1,6 +1,7 @@
 package rapid
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -311,25 +312,85 @@ func pollerForRemoteTest(t *testing.T, repoPath, zoektURL string) *Poller {
 	return p
 }
 
-// startMockZoektWithBranches serves an /api/list response describing one repo
-// with the given branch → indexed SHA map.
-func startMockZoektWithBranches(t *testing.T, repoName, repoPath string, branches map[string]string) string {
+// Two shards for one path: a repo whose remote URL changed leaves the old
+// shard behind under its old name, and zoekt lists both. Branch SHAs must come
+// from the newest shard whichever order zoekt returns them in, otherwise the
+// stale one keeps reporting origin/main as behind and the repo reindexes every
+// cycle without ever catching up.
+func TestRefreshRepoMap_NewestShardWins(t *testing.T) {
+	repoPath := t.TempDir()
+	abs, _ := filepath.Abs(repoPath)
+
+	live := mockRepoEntry{
+		Name: "example.com/new/name", Source: repoPath, IndexTime: "2026-10-21T08:22:35+11:00",
+		Branches: map[string]string{"HEAD": "head222", "origin/main": "main222"},
+	}
+	stale := mockRepoEntry{
+		Name: "example.com/old/name", Source: repoPath, IndexTime: "2026-09-23T13:02:13+10:00",
+		Branches: map[string]string{"HEAD": "head111", "origin/main": "main111"},
+	}
+
+	for _, order := range [][]mockRepoEntry{{live, stale}, {stale, live}} {
+		label := order[0].Name + " then " + order[1].Name
+		proxy := NewSearchProxy(startMockZoektList(t, order), NewStateTable())
+		proxy.RefreshRepoMap()
+
+		if got := proxy.IndexedBranchSHA(abs, "origin/main"); got != "main222" {
+			t.Errorf("%s: origin/main = %q, want main222", label, got)
+		}
+		if got := proxy.IndexedSHA(abs); got != "head222" {
+			t.Errorf("%s: HEAD = %q, want head222", label, got)
+		}
+		// Search hits still arrive from the stale shard until it is deleted, so
+		// both names must keep resolving to the path.
+		proxy.mu.RLock()
+		oldPath, newPath := proxy.nameToPath["example.com/old/name"], proxy.nameToPath["example.com/new/name"]
+		proxy.mu.RUnlock()
+		if oldPath != abs || newPath != abs {
+			t.Errorf("%s: nameToPath old=%q new=%q, want both %q", label, oldPath, newPath, abs)
+		}
+	}
+}
+
+// mockRepoEntry is one repo in a fake /api/list response.
+type mockRepoEntry struct {
+	Name      string
+	Source    string
+	IndexTime string // RFC3339; empty leaves IndexMetadata.IndexTime unset
+	Branches  map[string]string
+}
+
+// startMockZoektList serves an /api/list response describing the given repos.
+func startMockZoektList(t *testing.T, entries []mockRepoEntry) string {
 	t.Helper()
 
-	body := ""
-	for name, version := range branches {
-		if body != "" {
-			body += ","
-		}
-		body += fmt.Sprintf(`{"Name":%q,"Version":%q}`, name, version)
+	type branch struct {
+		Name    string
+		Version string
 	}
-	payload := fmt.Sprintf(`{"List":{"Repos":[{"Repository":{"Name":%q,"Source":%q,"Branches":[%s]}}]}}`,
-		repoName, repoPath, body)
+	repos := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		branches := make([]branch, 0, len(e.Branches))
+		for name, version := range e.Branches {
+			branches = append(branches, branch{name, version})
+		}
+		repo := map[string]any{
+			"Repository": map[string]any{"Name": e.Name, "Source": e.Source, "Branches": branches},
+		}
+		if e.IndexTime != "" {
+			repo["IndexMetadata"] = map[string]any{"IndexTime": e.IndexTime}
+		}
+		repos = append(repos, repo)
+	}
+	payload, err := json.Marshal(map[string]any{"List": map[string]any{"Repos": repos}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, payload)
+		w.Write(payload)
 	})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -340,4 +401,11 @@ func startMockZoektWithBranches(t *testing.T, repoName, repoPath string, branche
 	go srv.Serve(listener)
 	t.Cleanup(func() { srv.Close() })
 	return fmt.Sprintf("http://localhost:%d", listener.Addr().(*net.TCPAddr).Port)
+}
+
+// startMockZoektWithBranches serves an /api/list response describing one repo
+// with the given branch → indexed SHA map.
+func startMockZoektWithBranches(t *testing.T, repoName, repoPath string, branches map[string]string) string {
+	t.Helper()
+	return startMockZoektList(t, []mockRepoEntry{{Name: repoName, Source: repoPath, Branches: branches}})
 }

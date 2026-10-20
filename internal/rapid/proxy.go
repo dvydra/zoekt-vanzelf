@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ZoektSearchRequest is the JSON body sent to zoekt's /api/search.
@@ -48,6 +49,10 @@ type SearchProxy struct {
 	// each branch was at index time; used to spot a fetched remote branch that
 	// the shard hasn't caught up with.
 	pathToBranchSHA map[string]map[string]string
+
+	// Shard names already reported as stale duplicates, so the warning is
+	// logged once rather than on every refresh.
+	staleShardWarned map[string]bool
 }
 
 func NewSearchProxy(zoektURL string, state *StateTable) *SearchProxy {
@@ -60,10 +65,19 @@ func NewSearchProxy(zoektURL string, state *StateTable) *SearchProxy {
 		pathToSHA:   make(map[string]string),
 
 		pathToBranchSHA: make(map[string]map[string]string),
+
+		staleShardWarned: make(map[string]bool),
 	}
 }
 
 // RefreshRepoMap queries zoekt's /api/list and builds the repo name ↔ path mapping.
+//
+// A path can have more than one shard: when a repo's remote URL changes, the
+// next index writes a shard under the new name and the old one stays behind in
+// the index dir. Zoekt lists and searches both. Every name still maps to the
+// path so search hits from either shard merge correctly, but branch SHAs are
+// taken from the newest shard only. Merging them last-wins let a stale shard
+// report origin/main as behind forever, reindexing the repo every cycle.
 func (p *SearchProxy) RefreshRepoMap() {
 	type branchInfo struct {
 		Name    string `json:"Name"`
@@ -77,6 +91,9 @@ func (p *SearchProxy) RefreshRepoMap() {
 					Source   string       `json:"Source"`
 					Branches []branchInfo `json:"Branches"`
 				} `json:"Repository"`
+				IndexMetadata struct {
+					IndexTime string `json:"IndexTime"`
+				} `json:"IndexMetadata"`
 			} `json:"Repos"`
 		} `json:"List"`
 	}
@@ -101,10 +118,20 @@ func (p *SearchProxy) RefreshRepoMap() {
 		return
 	}
 
+	type shard struct {
+		name    string
+		indexed time.Time
+	}
+
 	nameToPath := make(map[string]string)
 	pathToNames := make(map[string][]string)
 	pathToSHA := make(map[string]string)
 	pathToBranchSHA := make(map[string]map[string]string)
+	newest := make(map[string]shard) // path → shard whose branch SHAs we trust
+	var stale []struct {
+		path, name, winner string
+		indexed            time.Time
+	}
 
 	for _, r := range lr.List.Repos {
 		name := r.Repository.Name
@@ -119,12 +146,33 @@ func (p *SearchProxy) RefreshRepoMap() {
 		}
 		nameToPath[name] = abs
 		pathToNames[abs] = append(pathToNames[abs], name)
-		// Record every indexed branch; HEAD also gets its own fast path.
-		branchSHA := pathToBranchSHA[abs]
-		if branchSHA == nil {
-			branchSHA = make(map[string]string, len(r.Repository.Branches))
-			pathToBranchSHA[abs] = branchSHA
+
+		// A missing or unparseable IndexTime reads as the zero time, so any
+		// dated shard beats it.
+		indexed, _ := time.Parse(time.RFC3339Nano, r.IndexMetadata.IndexTime)
+		cur := shard{name: name, indexed: indexed}
+		if prev, seen := newest[abs]; seen {
+			loser := cur
+			if cur.indexed.After(prev.indexed) {
+				loser = prev
+				newest[abs] = cur
+			}
+			stale = append(stale, struct {
+				path, name, winner string
+				indexed            time.Time
+			}{abs, loser.name, newest[abs].name, loser.indexed})
+			if loser.name == cur.name {
+				continue
+			}
+		} else {
+			newest[abs] = cur
 		}
+
+		// Record every indexed branch of the newest shard; HEAD also gets its
+		// own fast path.
+		branchSHA := make(map[string]string, len(r.Repository.Branches))
+		pathToBranchSHA[abs] = branchSHA
+		delete(pathToSHA, abs)
 		for _, b := range r.Repository.Branches {
 			if b.Version == "" {
 				continue
@@ -141,6 +189,14 @@ func (p *SearchProxy) RefreshRepoMap() {
 	p.pathToNames = pathToNames
 	p.pathToSHA = pathToSHA
 	p.pathToBranchSHA = pathToBranchSHA
+	for _, s := range stale {
+		if p.staleShardWarned[s.name] {
+			continue
+		}
+		p.staleShardWarned[s.name] = true
+		log.Printf("[%s] stale shard %q (indexed %s) for this path; using %q. Delete the old shard file to drop it from search results.",
+			s.path, s.name, s.indexed.Format(time.RFC3339), s.winner)
+	}
 	p.mu.Unlock()
 
 	log.Printf("refreshed repo map: %d zoekt repos mapped", len(nameToPath))
@@ -350,7 +406,7 @@ func deltaMatchesToRaw(repoName, filePath string, matches []DeltaMatch, useChunk
 				"Line":       encoded,
 				"LineStart":  0,
 				"LineEnd":    0,
-				"LineNumber": m.LineNumber,
+				"LineNumber":  m.LineNumber,
 				"Before":     nil,
 				"After":      nil,
 				"FileName":   false,

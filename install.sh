@@ -350,6 +350,9 @@ for old_label in com.zoekt.index com.zoekt.rapid; do
         launchctl bootout "gui/$(id -u)/$old_label" 2>/dev/null || true
         ok "Removed obsolete agent: $old_label"
     fi
+    # bootout alone leaves the plist behind, and launchd loads it again at
+    # next login.
+    rm -f "$HOME/Library/LaunchAgents/$old_label.plist"
 done
 
 # --- Done ---
