@@ -4,8 +4,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -22,6 +24,16 @@ type Watcher struct {
 
 	mu       sync.Mutex
 	repoDirs map[string]bool // watched repo paths
+
+	// On kqueue platforms (macOS, BSDs) fsnotify holds an open fd for every
+	// watched directory and every entry in it, so a large tree can fill the
+	// process's fd table. Once that happens every git subprocess fails with
+	// EMFILE and repo tracking collapses. fdBudget caps what the watcher may
+	// hold; repos that don't fit fall back to the poll interval. 0 = no cap.
+	fdBudget     int
+	fdUsed       int
+	fdCost       map[string]int // watched dir → fds it holds
+	budgetWarned bool
 }
 
 func NewWatcher(poller *Poller, state *StateTable, skipDirs []string) (*Watcher, error) {
@@ -39,7 +51,31 @@ func NewWatcher(poller *Poller, state *StateTable, skipDirs []string) (*Watcher,
 		watcher:  fsw,
 		skipDirs: skip,
 		repoDirs: make(map[string]bool),
+		fdBudget: watchFDBudget(),
+		fdCost:   make(map[string]int),
 	}, nil
+}
+
+// watchFDBudget returns how many fds the watcher may hold: the soft
+// RLIMIT_NOFILE, which the Go runtime has already raised to the hard limit,
+// minus headroom for git subprocesses, sockets and logs. Returns 0 (no cap)
+// on platforms where watches don't consume fds.
+func watchFDBudget() int {
+	switch runtime.GOOS {
+	case "darwin", "freebsd", "netbsd", "openbsd", "dragonfly":
+	default:
+		return 0
+	}
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		return 0
+	}
+	const headroom = 4096
+	cur := int(lim.Cur)
+	if cur <= 0 || cur <= 2*headroom {
+		return cur / 2
+	}
+	return cur - headroom
 }
 
 // Sync adds/removes watches to match the current set of managed repos.
@@ -143,6 +179,7 @@ func (w *Watcher) Close() error {
 
 // addRecursive walks a repo directory and adds watches for all subdirectories,
 // skipping .git, the configured skip-dir names, and any gitignored directory.
+// The walk stops for good once the fd budget is spent.
 func (w *Watcher) addRecursive(root string) {
 	// Gitignored dirs never enter `git status`, so watching them only produces
 	// no-op polls. Fetch them once per repo and prune whole subtrees in the
@@ -152,36 +189,63 @@ func (w *Watcher) addRecursive(root string) {
 		log.Printf("[watcher] %s: ignored-dir lookup failed, watching all: %v", root, err)
 		ignored = nil
 	}
-
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if name == ".git" || w.skipDirs[name] {
-			return filepath.SkipDir
-		}
-		// Prune gitignored subtrees (path != root: a repo root is never ignored).
-		if ignored != nil && path != root {
-			if rel, relErr := filepath.Rel(root, path); relErr == nil && ignored[rel] {
-				return filepath.SkipDir
-			}
-		}
-		if err := w.watcher.Add(path); err != nil {
-			log.Printf("[watcher] failed to watch %s: %v", path, err)
-		}
-		return nil
-	})
+	w.walkAndWatch(root, root, ignored)
 }
 
-// removeRecursive removes all watches under a repo directory.
+// walkAndWatch watches dir and recurses into its subdirectories. It returns
+// false once the fd budget is spent so callers stop walking.
+func (w *Watcher) walkAndWatch(root, dir string, ignored map[string]bool) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return true // unreadable dir: skip it, keep going
+	}
+
+	// kqueue opens the directory itself plus every entry in it.
+	cost := 1 + len(entries)
+	if w.fdBudget > 0 && w.fdUsed+cost > w.fdBudget {
+		if !w.budgetWarned {
+			w.budgetWarned = true
+			log.Printf("[watcher] fd budget of %d spent at %s; this and later repos rely on polling instead of instant change detection", w.fdBudget, root)
+		}
+		return false
+	}
+	if err := w.watcher.Add(dir); err != nil {
+		log.Printf("[watcher] failed to watch %s: %v", dir, err)
+	} else {
+		w.fdUsed += cost
+		w.fdCost[dir] = cost
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == ".git" || w.skipDirs[name] {
+			continue
+		}
+		sub := filepath.Join(dir, name)
+		// Prune gitignored subtrees (a repo root is never ignored).
+		if ignored != nil {
+			if rel, relErr := filepath.Rel(root, sub); relErr == nil && ignored[rel] {
+				continue
+			}
+		}
+		if !w.walkAndWatch(root, sub, ignored) {
+			return false
+		}
+	}
+	return true
+}
+
+// removeRecursive removes all watches under a repo directory and gives their
+// fds back to the budget.
 func (w *Watcher) removeRecursive(root string) {
 	for _, watched := range w.watcher.WatchList() {
 		if strings.HasPrefix(watched, root+"/") || watched == root {
 			w.watcher.Remove(watched)
+			w.fdUsed -= w.fdCost[watched]
+			delete(w.fdCost, watched)
 		}
 	}
 }

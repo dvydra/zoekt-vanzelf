@@ -77,7 +77,7 @@ func DefaultConfig() Config {
 		MaxConcurrentReindex: 2,
 		MaxDirtyFiles:        500,
 		MaxDeltaBytes:        50 * 1024 * 1024, // 50 MB
-		WatchSkipDirs:        []string{"node_modules", "vendor", ".terraform", ".next", "__pycache__", ".build", "dist", ".cache"},
+		WatchSkipDirs:        []string{"node_modules", "vendor", ".terraform", ".next", "__pycache__", ".build", "dist", ".cache", ".claude"},
 		ReindexGapMode:       "stale",
 		IndexRemoteDefault:   true,
 		RemoteRefInterval:    60 * time.Second,
